@@ -33,6 +33,55 @@ class OutdoorPolicy(PointNavBaselinePolicy):
             action_distribution_type=action_distribution_type,
         )
 
+    def evaluate_actions(
+        self, observations, rnn_hidden_states, prev_actions, masks, action, real_img
+    ):
+        sim_img = torch.cat(
+            [
+                # Spot is cross-eyed; right is on the left on the FOV
+                observations["spot_right_depth"],
+                observations["spot_left_depth"],
+            ],
+            dim=2,
+        )  # NHWC
+        real_obs = {"depth": real_img}
+
+        (
+            value,
+            action_log_probs,
+            distribution_entropy,
+            rnn_hidden_states,
+        ) = super().evaluate_actions(
+            observations,
+            rnn_hidden_states,
+            prev_actions,
+            masks,
+            action,
+        )
+
+        sim_vis_feats = self.net.visual_features
+        sampled_sim_vis_feats = self._sample_vis_feats(sim_vis_feats)
+        real_vis_feats = self.net.reality_visual_encoder(real_obs)
+        sampled_real_vis_feats = self._sample_vis_feats(real_vis_feats)
+
+        return (
+            value,
+            action_log_probs,
+            distribution_entropy,
+            rnn_hidden_states,
+            sim_img,
+            real_img,
+            sim_vis_feats,
+            real_vis_feats,
+            sampled_sim_vis_feats,
+            sampled_real_vis_feats,
+        )
+
+    @staticmethod
+    def _sample_vis_feats(mu_std):
+        dist = Normal(*mu_std)
+        return dist.rsample()
+
 
 class OutdoorPolicyNet(PointNavBaselineNet):
     def __init__(self, observation_space: spaces.Dict, hidden_size: int):
@@ -66,7 +115,9 @@ class Upsample(nn.Module):
         self.output_size = output_size
 
     def forward(self, x):
-        return F.interpolate(x, size=self.output_size, mode="bilinear")
+        return F.interpolate(
+            x, size=self.output_size, mode="bilinear", align_corners=False
+        )
 
 
 class Decoder(nn.Module):

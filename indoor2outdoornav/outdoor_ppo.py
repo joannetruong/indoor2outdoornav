@@ -22,12 +22,12 @@ class OutdoorPPO(PPO):
         kl_coeff,
         disc_coeff,
         recon_coeff,
-        lr,
-        eps,
+        lr=None,
+        eps=None,
         *args,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(lr=lr, eps=eps, *args, **kwargs)
         self.observations = None
         self.reconstruction_criterion = nn.L1Loss(reduction="mean")
         self.discriminator_criterion = nn.BCELoss(reduction="mean")
@@ -51,46 +51,27 @@ class OutdoorPPO(PPO):
             eps=eps,
         )
 
-    def sim_reconstruction_loss(self):
-        self.sampled_sim_vis_feats = self._sample_vis_feats(
-            self.actor_critic.net.visual_features
-        )
-        sim_depth_pred = self.actor_critic.net.sim_visual_decoder(
-            self.sampled_sim_vis_feats
-        )
-        sim_depth_label = torch.cat(
-            [
-                # Spot is cross-eyed; right is on the left on the FOV
-                self.observations["spot_right_depth"],
-                self.observations["spot_left_depth"],
-            ],
-            dim=2,
-        )  # NHWC
-        return self.reconstruction_criterion(sim_depth_pred, sim_depth_label)
-
-    def reality_reconstruction_loss(self):
-        real_img = next(iter(self.real_dataloader)).to(
-            device=self.actor_critic.net.visual_features[0].device
-        )
-        obs = {"depth": real_img}
-        self.real_vis_feats = self.actor_critic.net.reality_visual_encoder(obs)
-        self.sampled_real_vis_feats = self._sample_vis_feats(self.real_vis_feats)
-        real_depth_pred = self.actor_critic.net.reality_visual_decoder(
-            self.sampled_real_vis_feats
-        )
-        return self.reconstruction_criterion(real_depth_pred, real_img)
-
     @staticmethod
     def _sample_vis_feats(mu_std):
         dist = Normal(*mu_std)
         return dist.rsample()
 
-    def kl_divergence_loss(self):
-        sim_encoder_dist = Normal(*self.actor_critic.net.visual_features)
-        real_encoder_dist = Normal(*self.real_vis_feats)
+    def sim_reconstruction_loss(self, sim_img, sampled_sim_vis_feats):
+        sim_depth_pred = self.actor_critic.net.sim_visual_decoder(sampled_sim_vis_feats)
+        return self.reconstruction_criterion(sim_depth_pred, sim_img)
+
+    def reality_reconstruction_loss(self, real_img, sampled_real_vis_feats):
+        real_depth_pred = self.actor_critic.net.reality_visual_decoder(
+            sampled_real_vis_feats
+        )
+        return self.reconstruction_criterion(real_depth_pred, real_img)
+
+    def kl_divergence_loss(self, sim_vis_feats, real_vis_feats):
+        sim_encoder_dist = Normal(*sim_vis_feats)
+        real_encoder_dist = Normal(*real_vis_feats)
         unit_normal = Normal(
-            torch.zeros_like(self.real_vis_feats[0]),
-            torch.ones_like(self.real_vis_feats[0]),
+            torch.zeros_like(real_vis_feats[0]),
+            torch.ones_like(real_vis_feats[0]),
         )
 
         return (
@@ -98,14 +79,11 @@ class OutdoorPPO(PPO):
             + kl_divergence(real_encoder_dist, unit_normal).mean()
         )
 
-    def discriminator_loss(self):
-        sim_vis_feats = self.sampled_sim_vis_feats
-        real_vis_feats = self.sampled_real_vis_feats
-
-        vis_feats = torch.cat([sim_vis_feats, real_vis_feats], dim=0)
+    def discriminator_loss(self, sampled_sim_vis_feats, sampled_real_vis_feats):
+        vis_feats = torch.cat([sampled_sim_vis_feats, sampled_real_vis_feats], dim=0)
         preds = self.actor_critic.net.discriminator(vis_feats)
 
-        num_samples = sim_vis_feats.shape[0]
+        num_samples = sampled_sim_vis_feats.shape[0]
         labels = torch.ones_like(preds)
         labels[:num_samples, :] = 0
         return self.discriminator_criterion(preds, labels)
@@ -114,26 +92,58 @@ class OutdoorPPO(PPO):
         self.losses["sim_recon_loss"] = (
             self.recon_coeff * self.sim_reconstruction_loss()
         )
-        self.losses["real_recon_loss"] = (
-            self.recon_coeff * self.reality_reconstruction_loss()
+        self.losses[
+            "real_recon_loss"
+        ] = self.recon_coeff * self.reality_reconstruction_loss(
+            self.real_img, self.sampled_real_vis_feats
         )
-        self.losses["kl_loss"] = self.kl_coeff * self.kl_divergence_loss()
-        # self.losses["disc_loss"] = self.disc_coeff * self.discriminator_loss()
+        self.losses["kl_loss"] = self.kl_coeff * self.kl_divergence_loss(
+            self.sim_vis_feats, self.real_vis_feats
+        )
+        self.disc_loss = self.disc_coeff * self.discriminator_loss(
+            self.sampled_sim_vis_feats, self.sampled_real_vis_feats
+        )
+        self.losses["disc_loss"] = self.disc_loss
 
         for v in self.losses.values():
             loss += v
 
     def after_backward(self, loss):
+        # # want to encourage generating sim encodings similar to real encodings
+        # vis_feats = torch.cat([sampled_sim_vis_feats, sampled_real_vis_feats], dim=0)
+        # preds = self.actor_critic.net.discriminator(vis_feats)
+        #
+        # -self.disc_loss.backwards()
+        #
+        # self.optimizer.step()
+        #
+        # # freeze decoder
+        # ## gradient ascent on visual encoder
         pass
 
     def _evaluate_actions(
         self, observations, rnn_hidden_states, prev_actions, masks, action
     ):
         self.observations = observations
-        ret = self.actor_critic.evaluate_actions(
-            observations, rnn_hidden_states, prev_actions, masks, action
+        real_img = next(iter(self.real_dataloader)).to(
+            device=self.actor_critic.net.visual_features[0].device
         )
-        return ret
+
+        (
+            values,
+            action_log_probs,
+            dist_entropy,
+            hx,
+            self.sim_img,
+            self.real_img,
+            self.sim_vis_feats,
+            self.real_vis_feats,
+            self.sampled_sim_vis_feats,
+            self.sampled_real_vis_feats,
+        ) = self.actor_critic.evaluate_actions(
+            observations, rnn_hidden_states, prev_actions, masks, action, real_img
+        )
+        return values, action_log_probs, dist_entropy, hx
 
 
 class OutdoorDDPPO(DecentralizedDistributedMixin, OutdoorPPO):
@@ -141,6 +151,23 @@ class OutdoorDDPPO(DecentralizedDistributedMixin, OutdoorPPO):
         self, observations, rnn_hidden_states, prev_actions, masks, action
     ):
         self.observations = observations
-        return super()._evaluate_actions(
-            observations, rnn_hidden_states, prev_actions, masks, action
+        real_img = next(iter(self.real_dataloader)).to(
+            device=self.net.visual_features[0].device
         )
+        real_obs = {"depth": real_img}
+
+        (
+            values,
+            action_log_probs,
+            dist_entropy,
+            hx,
+            self.sim_img,
+            self.real_img,
+            self.sim_vis_feats,
+            self.real_vis_feats,
+            self.sampled_sim_vis_feats,
+            self.sampled_real_vis_feats,
+        ) = self._evaluate_actions_wrapper.ddp(
+            observations, rnn_hidden_states, prev_actions, masks, action, real_obs
+        )
+        return values, action_log_probs, dist_entropy, hx
