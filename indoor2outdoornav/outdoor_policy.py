@@ -23,7 +23,7 @@ class OutdoorPolicy(PointNavBaselinePolicy):
         action_distribution_type: str = "gaussian",
         kl_coeff: float = 0.125,
         disc_coeff: float = 8.0,
-        enc_disc_coeff: float = 1.0,
+        enc_gen_coeff: float = 1.0,
         recon_coeff: float = 1.0,
         **kwargs,
     ):
@@ -43,7 +43,7 @@ class OutdoorPolicy(PointNavBaselinePolicy):
         self.disc_loss = None
         self.kl_coeff = kl_coeff
         self.disc_coeff = disc_coeff
-        self.enc_disc_coeff = enc_disc_coeff
+        self.enc_gen_coeff = enc_gen_coeff
         self.recon_coeff = recon_coeff
         self.reconstruction_criterion = nn.L1Loss(reduction="mean")
         self.discriminator_criterion = nn.BCELoss(reduction="mean")
@@ -56,12 +56,19 @@ class OutdoorPolicy(PointNavBaselinePolicy):
             hidden_size=config.RL.PPO.hidden_size,
             kl_coeff=config.RL.OUTDOOR.kl_coeff,
             disc_coeff=config.RL.OUTDOOR.disc_coeff,
-            enc_disc_coeff=config.RL.OUTDOOR.enc_disc_coeff,
+            enc_gen_coeff=config.RL.OUTDOOR.enc_gen_coeff,
             recon_coeff=config.RL.OUTDOOR.recon_coeff,
         )
 
     def evaluate_actions(
-        self, observations, rnn_hidden_states, prev_actions, masks, action, real_img
+        self,
+        observations,
+        rnn_hidden_states,
+        prev_actions,
+        masks,
+        action,
+        sim_img,
+        real_img,
     ):
         (
             value,
@@ -76,34 +83,9 @@ class OutdoorPolicy(PointNavBaselinePolicy):
             action,
         )
 
-        sim_img = torch.cat(
-            [
-                # Spot is cross-eyed; right is on the left on the FOV
-                observations["spot_right_depth"],
-                observations["spot_left_depth"],
-            ],
-            dim=2,
-        )  # NHWC
-        real_obs = {"depth": real_img}
-
-        sim_vis_feats = self.net.visual_features
-        sampled_sim_vis_feats = self._sample_vis_feats(sim_vis_feats)
-        real_vis_feats = self.net.reality_visual_encoder(real_obs)
-        sampled_real_vis_feats = self._sample_vis_feats(real_vis_feats)
-
-        (
-            sim_recon_loss,
-            real_recon_loss,
-            kl_loss,
-            disc_loss,
-            enc_disc_loss,
-        ) = self.calculate_losses(
+        (kl_loss, disc_loss, enc_gen_loss,) = self.calculate_losses(
             sim_img,
             real_img,
-            sim_vis_feats,
-            sampled_sim_vis_feats,
-            real_vis_feats,
-            sampled_real_vis_feats,
         )
 
         return (
@@ -111,23 +93,33 @@ class OutdoorPolicy(PointNavBaselinePolicy):
             action_log_probs,
             distribution_entropy,
             rnn_hidden_states,
-            sim_recon_loss,
-            real_recon_loss,
             kl_loss,
             disc_loss,
-            enc_disc_loss,
+            enc_gen_loss,
         )
+
+    def after_step(self, sim_img, sim_obs, real_img):
+        sim_recon_loss = self.sim_reconstruction_loss(sim_img, sim_obs)
+        real_recon_loss = self.reality_reconstruction_loss(real_img)
+        return sim_recon_loss, real_recon_loss
 
     @staticmethod
     def _sample_vis_feats(mu_std):
         dist = Normal(*mu_std)
         return dist.rsample()
 
-    def sim_reconstruction_loss(self, sim_img, sampled_sim_vis_feats):
+    def sim_reconstruction_loss(self, sim_img, sim_obs):
+        sim_vis_feats = self.net.visual_encoder(sim_obs)
+        sampled_sim_vis_feats = self._sample_vis_feats(sim_vis_feats)
+
         sim_depth_pred = self.net.sim_visual_decoder(sampled_sim_vis_feats)
         return self.reconstruction_criterion(sim_depth_pred, sim_img)
 
-    def reality_reconstruction_loss(self, real_img, sampled_real_vis_feats):
+    def reality_reconstruction_loss(self, real_img):
+        real_obs = {"depth": real_img}
+        real_vis_feats = self.net.reality_visual_encoder(real_obs)
+        sampled_real_vis_feats = self._sample_vis_feats(real_vis_feats)
+
         real_depth_pred = self.net.reality_visual_decoder(sampled_real_vis_feats)
         return self.reconstruction_criterion(real_depth_pred, real_img)
 
@@ -154,51 +146,52 @@ class OutdoorPolicy(PointNavBaselinePolicy):
         labels_real = torch.ones_like(pred_real)
         loss_D_real = self.discriminator_criterion(pred_real, labels_real)
 
-        pred_sim = self.net.discriminator(sampled_sim_vis_feats.detach())
+        pred_sim = self.net.discriminator(sampled_sim_vis_feats)
         labels_sim = torch.zeros_like(pred_sim)
         loss_D_sim = self.discriminator_criterion(pred_sim, labels_sim)
 
-        return (loss_D_real + loss_D_sim) * 0.5
+        return loss_D_real + loss_D_sim
 
-    def encoder_discriminator_loss(self, sim_img):
-        # # want to encourage generating sim encodings similar to real encodings
+    def encoder_generator_loss(self, sim_obs):
+        sim_vis_feats = self.net.visual_encoder(sim_obs)
+        sampled_sim_vis_feats = self._sample_vis_feats(sim_vis_feats)
+
+        preds = self.net.discriminator(sampled_sim_vis_feats)
+        # labels are real for generator
+        labels = torch.ones_like(preds)
+        enc_gen_loss = self.discriminator_criterion(preds, labels)
+        return enc_gen_loss
+
+    def calculate_losses(
+        self,
+        sim_img,
+        real_img,
+    ):
         width = sim_img.shape[2]
         sim_right_depth, sim_left_depth = torch.split(sim_img, int(width / 2), 2)
         sim_obs = {
             "spot_right_depth": sim_right_depth,
             "spot_left_depth": sim_left_depth,
         }
+        real_obs = {"depth": real_img}
+        #
+        # sim_recon_loss = self.recon_coeff * self.sim_reconstruction_loss(
+        #     sim_img, sim_obs
+        # )
+        # real_recon_loss = self.recon_coeff * self.reality_reconstruction_loss(real_img)
 
         sim_vis_feats = self.net.visual_encoder(sim_obs)
-        sampled_sim_vis_feats = self._sample_vis_feats(sim_vis_feats)
-        preds = self.net.discriminator(sampled_sim_vis_feats)
-        # labels are real for generator
-        labels = torch.ones_like(preds)
-        enc_disc_loss = self.discriminator_criterion(preds, labels)
-        return enc_disc_loss
+        real_vis_feats = self.net.reality_visual_encoder(real_obs)
 
-    def calculate_losses(
-        self,
-        sim_img,
-        real_img,
-        sim_vis_feats,
-        sampled_sim_vis_feats,
-        real_vis_feats,
-        sampled_real_vis_feats,
-    ):
-        sim_recon_loss = self.recon_coeff * self.sim_reconstruction_loss(
-            sim_img, sampled_sim_vis_feats
-        )
-        real_recon_loss = self.recon_coeff * self.reality_reconstruction_loss(
-            real_img, sampled_real_vis_feats
-        )
+        sampled_sim_vis_feats = self._sample_vis_feats(sim_vis_feats)
+        sampled_real_vis_feats = self._sample_vis_feats(real_vis_feats)
+
         kl_loss = self.kl_coeff * self.kl_divergence_loss(sim_vis_feats, real_vis_feats)
         disc_loss = self.disc_coeff * self.discriminator_loss(
             sampled_sim_vis_feats, sampled_real_vis_feats
         )
-        enc_disc_loss = self.enc_disc_coeff * self.encoder_discriminator_loss(sim_img)
-        # enc_disc_loss = 0.0
-        return sim_recon_loss, real_recon_loss, kl_loss, disc_loss, enc_disc_loss
+        enc_gen_loss = self.enc_gen_coeff * self.encoder_generator_loss(sim_obs)
+        return kl_loss, disc_loss, enc_gen_loss
 
 
 class OutdoorPolicyNet(PointNavBaselineNet):
