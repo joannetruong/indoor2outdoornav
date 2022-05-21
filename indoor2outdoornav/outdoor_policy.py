@@ -45,8 +45,10 @@ class OutdoorPolicy(PointNavBaselinePolicy):
         self.disc_coeff = disc_coeff
         self.enc_gen_coeff = enc_gen_coeff
         self.recon_coeff = recon_coeff
-        self.reconstruction_criterion = nn.L1Loss(reduction="mean")
+        # self.reconstruction_criterion = nn.L1Loss(reduction="mean")
         self.discriminator_criterion = nn.BCELoss(reduction="mean")
+        log_scale = nn.Parameter(torch.Tensor([0.0]))
+        self.scale = torch.exp(log_scale)
 
     @classmethod
     def from_config(cls, config: Config, observation_space: spaces.Dict, action_space):
@@ -98,6 +100,11 @@ class OutdoorPolicy(PointNavBaselinePolicy):
             enc_gen_loss,
         )
 
+    def calc_recon_loss(self, pred, gt):
+        dist = Normal(pred, self.scale.to(self.net.visual_features[0].device))
+        log_pxz = dist.log_prob(gt)
+        return log_pxz.sum(dim=(1, 2, 3)).mean()
+
     def after_step(self, sim_img, sim_obs, real_img):
         sim_recon_loss = self.sim_reconstruction_loss(sim_img, sim_obs)
         real_recon_loss = self.reality_reconstruction_loss(real_img)
@@ -113,7 +120,7 @@ class OutdoorPolicy(PointNavBaselinePolicy):
         sampled_sim_vis_feats = self._sample_vis_feats(sim_vis_feats)
 
         sim_depth_pred = self.net.sim_visual_decoder(sampled_sim_vis_feats)
-        return self.reconstruction_criterion(sim_depth_pred, sim_img)
+        return self.calc_recon_loss(sim_depth_pred, sim_img)
 
     def reality_reconstruction_loss(self, real_img):
         real_obs = {"depth": real_img}
@@ -121,25 +128,21 @@ class OutdoorPolicy(PointNavBaselinePolicy):
         sampled_real_vis_feats = self._sample_vis_feats(real_vis_feats)
 
         real_depth_pred = self.net.reality_visual_decoder(sampled_real_vis_feats)
-        return self.reconstruction_criterion(real_depth_pred, real_img)
+        return self.calc_recon_loss(real_depth_pred, real_img)
 
-    def kl_divergence_loss(self, sim_vis_feats, real_vis_feats):
-        sim_encoder_dist = Normal(*sim_vis_feats)
-        real_encoder_dist = Normal(*real_vis_feats)
-        sim_unit_normal = Normal(
-            torch.zeros_like(sim_vis_feats[0]),
-            torch.ones_like(sim_vis_feats[0]),
+    def kl_divergence_loss(self, mu_std, samp_vis_feats):
+        p = Normal(
+            torch.zeros_like(mu_std[0]),
+            torch.ones_like(mu_std[1]),
         )
+        q = Normal(*mu_std)
 
-        real_unit_normal = Normal(
-            torch.zeros_like(real_vis_feats[0]),
-            torch.ones_like(real_vis_feats[0]),
-        )
+        log_qzx = q.log_prob(samp_vis_feats)
+        log_pz = p.log_prob(samp_vis_feats)
 
-        return (
-            kl_divergence(sim_encoder_dist, sim_unit_normal).mean()
-            + kl_divergence(real_encoder_dist, real_unit_normal).mean()
-        )
+        kl_loss = (log_qzx - log_pz)
+        
+        return kl_loss.sum(-1).mean()
 
     def discriminator_loss(self, sampled_sim_vis_feats, sampled_real_vis_feats):
         pred_real = self.net.discriminator(sampled_real_vis_feats)
@@ -186,7 +189,9 @@ class OutdoorPolicy(PointNavBaselinePolicy):
         sampled_sim_vis_feats = self._sample_vis_feats(sim_vis_feats)
         sampled_real_vis_feats = self._sample_vis_feats(real_vis_feats)
 
-        kl_loss = self.kl_coeff * self.kl_divergence_loss(sim_vis_feats, real_vis_feats)
+        kl_loss_sim = self.kl_divergence_loss(sim_vis_feats, sampled_sim_vis_feats)
+        kl_loss_real = self.kl_divergence_loss(real_vis_feats, sampled_real_vis_feats)
+        kl_loss = self.kl_coeff * (kl_loss_sim + kl_loss_real)
         disc_loss = self.disc_coeff * self.discriminator_loss(
             sampled_sim_vis_feats, sampled_real_vis_feats
         )
@@ -261,6 +266,20 @@ class StochasticCNN(SimpleCNN):
         x = super().forward(observations)
         mean, std = torch.split(x, [self.output_size, self.output_size], dim=1)
         std = torch.clamp(std, min=1e-6, max=1)
+        return mean, std
+
+class StochasticCNNv2(SimpleCNN):
+    def __init__(self, observation_space, output_size):
+        super().__init__(observation_space, output_size * 2)
+        in_size = output_size * 2
+        self.mu = nn.Linear(in_size, output_size)
+        self.std = nn.Linear(in_size, output_size)
+
+
+    def forward(self, observations):
+        x = super().forward(observations)
+        mean = self.mu(x)
+        std = torch.clamp(self.std(x),  min=1e-6, max=1)
         return mean, std
 
 
